@@ -26,12 +26,21 @@ node test.mjs        # 330+ tests, no install needed
 | `shots.py` | renders every view to PNG with headless Chrome, including phone widths and dark mode |
 | `diag.py` | reports which elements overflow the viewport at a given width |
 | `sharecheck.py` | end-to-end: makes the page serialise a shareable copy, then opens that copy and checks it boots with the data |
+| `linkcheck.py` | end-to-end: has one browser build a share link, then opens it in a browser with none of the sender's data |
 
 All three need Google Chrome installed.
 
 ## How it holds data
 
-State is a single serialisable object persisted to `localStorage`, plus explicit JSON export and import. There is no server, so a plan moves between devices by exporting a backup or by sending a working copy: a full copy of the page with the answers embedded as a seed script, which opens standalone in any browser and stores under its own key so it never collides with the reader's own plan.
+State is a single serialisable object persisted to `localStorage`, plus explicit JSON export and import. There is no server and nothing is ever uploaded.
+
+A plan reaches someone else three ways, and all three feed the same `hydrate()` seam on arrival:
+
+- **A link.** The state is gzipped and base64url-encoded into the URL fragment. Browsers never send a fragment to the server, so the plan travels inside the message and GitHub only ever serves the page. This is the only route that works on a phone, which is why the app is hosted rather than passed around as a file.
+- **A file.** The page serialises its own DOM with the state embedded as a seed script. Self-contained and works offline forever, but iOS has no way to open a local HTML file in a browser, so it is a desktop route.
+- **Backup text.** Plain JSON, copied and pasted.
+
+A received plan is stored under its own key derived from the seed id, so a counselor reading three students' plans never overwrites their own or each other's.
 
 ## Deploying
 

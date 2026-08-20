@@ -474,8 +474,15 @@ const VIEWS=[['mirror','You'],['paths','Paths'],['money','Money'],['compare','Co
 /* ---------- state ---------- */
 /* A copy someone was sent carries its seed inline. It stores under its own key so a
    counselor reviewing three students never overwrites their own plan or each other. */
-const SEED=(typeof window!=='undefined'&&window.__SEED__&&typeof window.__SEED__==='object')?window.__SEED__:null;
-const KEY=SEED?('nextmove.shared.'+String(SEED.id||'x').replace(/[^a-z0-9]/gi,'')):'nextmove.v1';
+let SEED=(typeof window!=='undefined'&&window.__SEED__&&typeof window.__SEED__==='object')?window.__SEED__:null;
+const sharedKey=id=>'nextmove.shared.'+String(id||'x').replace(/[^a-z0-9]/gi,'');
+let KEY=SEED?sharedKey(SEED.id):'nextmove.v1';
+/* A plan can also arrive in the URL. Detected synchronously so boot can put up a
+   holding screen; unpacked asynchronously because gzip decoding is async. */
+const hashSeed=(function(){
+  try{ const h=String(window.location.hash||''); return h.indexOf('#p=')===0?h.slice(3):''; }
+  catch(e){ return ''; }
+})();
 const blank=()=>({version:1,view:'welcome',mirrorIdx:0,ratings:{},free:{},paths:[],
   plan:{grad:'',ms:{},keep:[],actions:[{t:'',d:'',p:''},{t:'',d:'',p:''},{t:'',d:'',p:''}],who:'',adult:'',review:'',help:''}});
 let S=blank(), memOnly=false, seq=0;
@@ -542,15 +549,37 @@ function hideToast(){const e=byId('toast'); if(e){clearTimeout(e._t); e.classLis
 
 /* Anything that destroys work keeps one snapshot, so "are you sure" is not the only
    thing between a teenager and a lost evening. */
-const UNDO_KEY=KEY+'.undo';
+const undoKey=()=>KEY+'.undo';
+function describeState(st){
+  const bits=[];
+  const n=(st.paths||[]).length; if(n)bits.push(n+' path'+(n===1?'':'s'));
+  const r=Object.keys(st.ratings||{}).length; if(r)bits.push(r+' of 12 ratings');
+  const pl=st.plan||{};
+  if(pl.grad||Object.keys(pl.ms||{}).length)bits.push('your plan');
+  if(!bits.length)return 'an empty start';
+  if(bits.length===1)return bits[0];
+  return bits.slice(0,-1).join(', ')+' and '+bits[bits.length-1];
+}
+function agoText(iso){
+  try{
+    const then=new Date(iso).getTime(), mins=Math.round((new Date().getTime()-then)/60000);
+    if(!isFinite(mins)||mins<0)return '';
+    if(mins<1)return 'a moment ago';
+    if(mins<60)return mins+' minute'+(mins===1?'':'s')+' ago';
+    const hrs=Math.round(mins/60);
+    if(hrs<24)return hrs+' hour'+(hrs===1?'':'s')+' ago';
+    const days=Math.round(hrs/24);
+    return days+' day'+(days===1?'':'s')+' ago';
+  }catch(e){return '';}
+}
 function stashUndo(what){
-  try{localStorage.setItem(UNDO_KEY,JSON.stringify({what:what,at:new Date().toISOString(),state:S}));}catch(e){}
+  try{localStorage.setItem(undoKey(),JSON.stringify({what:what,at:new Date().toISOString(),state:S}));}catch(e){}
 }
 function peekUndo(){
-  try{const raw=localStorage.getItem(UNDO_KEY); if(!raw)return null;
+  try{const raw=localStorage.getItem(undoKey()); if(!raw)return null;
     const o=JSON.parse(raw); return (o&&o.state)?o:null;}catch(e){return null;}
 }
-function dropUndo(){try{localStorage.removeItem(UNDO_KEY);}catch(e){}}
+function dropUndo(){try{localStorage.removeItem(undoKey());}catch(e){}}
 function restoreUndo(){
   const u=peekUndo(); if(!u){toast('There is nothing to restore.');return;}
   const n=Object.assign(blank(),u.state);
@@ -764,6 +793,76 @@ let editing=null, adding=false, noteOpen={}, stepOpen={}, tuesMore={}, yearsOthe
 let canDownload = (typeof claude==='undefined');
 /* Whether this copy can put a real file into someone's hands. The hosted copy runs
    inside another page and can do neither, so it must not offer to. */
+/* A link is only worth offering where the page's own URL is one a recipient could
+   open: a real top-level http(s) page. Not a local file, not inside someone's iframe. */
+const inFrame=(function(){ try{ return window.top!==window.self; }catch(e){ return true; } })();
+const canLink=(function(){
+  try{ return !inFrame&&/^https?:$/.test(window.location.protocol); }catch(e){ return false; }
+})();
+const LINK_CAP=4000;
+
+function b64url(bytes){
+  let s='';
+  for(let i=0;i<bytes.length;i+=0x8000)s+=String.fromCharCode.apply(null,bytes.subarray(i,i+0x8000));
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function unb64url(str){
+  const t=str.replace(/-/g,'+').replace(/_/g,'/');
+  const pad=(4-(t.length%4))%4;
+  const bin=atob(t+'===='.slice(0,pad));
+  const out=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++)out[i]=bin.charCodeAt(i);
+  return out;
+}
+function seedPayload(){
+  return {from:(S.plan.who||'').trim(),at:new Date().toISOString(),
+    id:'sh'+new Date().getTime().toString(36),state:S};
+}
+/* 'z' marks gzip, 'r' marks raw, so a reader never has to guess. */
+async function encodeSeed(payload){
+  const bytes=new TextEncoder().encode(JSON.stringify(payload));
+  if(typeof CompressionStream==='undefined')return 'r'+b64url(bytes);
+  try{
+    const cs=new CompressionStream('gzip');
+    const w=cs.writable.getWriter(); w.write(bytes); w.close();
+    const buf=await new Response(cs.readable).arrayBuffer();
+    return 'z'+b64url(new Uint8Array(buf));
+  }catch(e){ return 'r'+b64url(bytes); }
+}
+async function decodeSeed(str){
+  if(!str)throw new Error('empty');
+  const kind=str.charAt(0), bytes=unb64url(str.slice(1));
+  let json;
+  if(kind==='z'){
+    if(typeof DecompressionStream==='undefined')throw new Error('no gzip here');
+    const ds=new DecompressionStream('gzip');
+    const w=ds.writable.getWriter(); w.write(bytes); w.close();
+    json=new TextDecoder().decode(await new Response(ds.readable).arrayBuffer());
+  }else if(kind==='r'){
+    json=new TextDecoder().decode(bytes);
+  }else throw new Error('unknown encoding');
+  const o=JSON.parse(json);
+  if(!o||typeof o!=='object'||!o.state||typeof o.state!=='object')throw new Error('no plan in there');
+  return o;
+}
+async function buildLink(){
+  const base=window.location.origin+window.location.pathname;
+  return base+'#p='+await encodeSeed(seedPayload());
+}
+async function shareLink(){
+  let url;
+  try{ url=await buildLink(); }
+  catch(e){ toast('Could not build a link here.'); return; }
+  const long=url.length>LINK_CAP;
+  const subject=shareSubject();
+  if(typeof navigator!=='undefined'&&navigator.share){
+    try{ await navigator.share({title:subject,url:url}); return; }
+    catch(err){ if(err&&err.name==='AbortError')return; }
+  }
+  copyOrShow(url,'Link copied.'+(long?' It is long, so send it in Messages rather than email.':' Paste it into a message or an email.'));
+  if(long)toast('That link is long. Messages handles it; some email apps break long links.');
+}
+
 function canShareFile(){
   try{
     if(typeof navigator==='undefined'||!navigator.share||!navigator.canShare)return false;
@@ -1256,13 +1355,21 @@ function vPlan(){
    '</div></div>';
 
   h+='<div class="sec"><h3>Send it to someone</h3>';
-  if(canSendCopy){
+  if(canLink){
+    h+='<div class="subh">Your counselor, a parent, whoever is helping. This sends a link that opens your whole plan in their browser: every tab, every number, exactly as you see it. Nothing to install, no account, and it works on a phone.</div>'+
+     '<div style="display:flex;gap:10px;flex-wrap:wrap">'+
+     '<button class="btn sm" data-act="sharelink">Send a link</button>'+
+     (canSendCopy?'<button class="btn ghost sm" data-act="sharecopy">Send the page as a file</button>':'')+
+     '<button class="btn ghost sm" data-act="copytext">Copy as plain text</button></div>'+
+     '<p class="small dim" style="margin-top:12px">Your answers travel inside the link itself, in the part after the #. Browsers never send that to a server, so nothing about your plan is uploaded anywhere. The link is not secret though: anyone who has it can read it, so treat it like emailing a document.</p>'+
+     '<p class="small dim">It is a snapshot, not a live view. What they open is your plan as it is right now, and it will not change when you do, so send a fresh link when it has moved on. The file version is the one to use if you want them to have a copy that keeps working with no internet.</p>';
+  }else if(canSendCopy){
     h+='<div class="subh">Your counselor, a parent, whoever is helping. This sends a whole working copy of this page with your answers already in it. They open the file in a browser on a computer and can click through every tab exactly as you see it. Nothing to install, no account, works offline.</div>'+
      '<div style="display:flex;gap:10px;flex-wrap:wrap">'+
      '<button class="btn sm" data-act="sharecopy">Send a working copy</button>'+
      '<button class="btn ghost sm" data-act="mail">Send a plain-text summary instead</button>'+
      '<button class="btn ghost sm" data-act="copytext">Copy that text</button></div>'+
-     '<p class="small dim" style="margin-top:12px">Two things worth knowing. It is a copy, not a live link: anything they type stays with them, and anything you change afterwards will not reach them, so send a fresh one when it has moved on. And a phone will not open it. iPhones in particular have no way to open a saved web page in a browser, so send the file to a computer.</p>';
+     '<p class="small dim" style="margin-top:12px">Two things worth knowing. It is a copy, not a live link: anything they type stays with them, and anything you change afterwards will not reach them, so send a fresh one when it has moved on. And a phone will not open it. iPhones in particular have no way to open a saved web page in a browser, so send the file to a computer, or open this plan from its web address and send a link instead.</p>';
   }else{
     h+='<div class="subh">This copy is running inside another page, so it cannot hand you a file to send. What it can do is give you the text.</div>'+
      '<div style="display:flex;gap:10px;flex-wrap:wrap">'+
@@ -1309,11 +1416,15 @@ function vBackup(){
    '<div style="margin-top:8px"><button class="btn sm" data-act="paste">Load it</button></div></div></div>';
 
   const u=peekUndo();
-  if(u)h+='<div class="sec"><h3 style="color:var(--good)">You can still get it back</h3>'+
-   '<div class="subh">The last thing you erased or replaced was '+esc(u.what||'your work')+'. It is still here until you replace it or clear it.</div>'+
+  if(u){
+    const ago=agoText(u.at);
+    h+='<div class="sec"><h3 style="color:var(--good)">You can still get it back</h3>'+
+    '<div class="subh">Just before the last erase or load, this device held '+esc(describeState(u.state))+'.'+
+    (ago?' Kept '+esc(ago)+'.':'')+' Putting it back replaces whatever is here now. There is only ever one of these, so the next erase or load overwrites it.</div>'+
    '<div style="display:flex;gap:10px;flex-wrap:wrap">'+
    '<button class="btn sm" data-act="undo">Put it back</button>'+
    '<button class="btn ghost sm" data-act="forgetundo">Clear it</button></div></div>';
+  }
 
   h+='<div class="sec"><h3>Start over</h3>'+
    '<div class="subh">Clears the page and returns you to the first screen. It asks first, and it keeps one restore point so a mis-tap is not the end of the world. That restore point is not a backup, though, so take a copy out if this matters.</div>'+
@@ -1608,7 +1719,7 @@ function importText(t){
   if(!st||typeof st!=='object'||Array.isArray(st)){toast('That backup is missing its data. Nothing was changed.');return;}
   const n=hydrate(st);
   n.view=RENDER[st.view]?st.view:'paths';
-  stashUndo('what was here before');
+  stashUndo(describeState(S));
   S=n; editing=null; adding=false; save(); render({top:true});
   toast('Backup loaded.',{act:'undo',label:'Undo'});
 }
@@ -1729,6 +1840,7 @@ document.addEventListener('click',e=>{
   if(a==='mail'){mailIt(); return;}
   if(a==='copytext'){copyOrShow(buildShareText(),'Copied. Paste it into an email or a message.'); return;}
   if(a==='sharecopy'){shareCopy(); return;}
+  if(a==='sharelink'){shareLink(); return;}
   if(a==='ms'){const m=el.dataset.m; if(!S.plan.ms[m])S.plan.ms[m]={done:false,note:''};
     S.plan.ms[m].done=!S.plan.ms[m].done; save(); return render();}
   if(a==='dl'){saveBackup(); return;}
@@ -1772,18 +1884,50 @@ byId('themeBtn').addEventListener('click',()=>{
 
 /* ---------- boot ---------- */
 try{const t=localStorage.getItem('nextmove.theme'); if(t)document.documentElement.setAttribute('data-theme',t);}catch(e){}
+function showSharedBanner(){
+  const bar=byId('sharedbar'); if(!bar||!SEED)return;
+  const who=(SEED.from||'').trim();
+  let when='';
+  try{ if(SEED.at)when=' on '+new Date(SEED.at).toLocaleDateString(undefined,{month:'long',day:'numeric',year:'numeric'}); }catch(e){}
+  bar.innerHTML='You are looking at <b>'+esc(who?who+"'s plan":'a plan someone shared with you')+'</b>'+esc(when)+
+    '. Anything you change stays on this device and does not reach them.';
+  bar.style.display='block';
+}
+/* Take over from a plan that arrived in a link. Anything the reader already did
+   with this same link wins over the seed, exactly as with a shared file. */
+function adoptShared(payload){
+  SEED=payload;
+  KEY=sharedKey(payload.id);
+  let raw=null; try{raw=localStorage.getItem(KEY);}catch(e){}
+  let restored=false;
+  if(raw){ try{ const o=JSON.parse(raw); if(o&&o.version===1){S=hydrate(o); restored=true;} }catch(e){} }
+  if(!restored){ S=hydrate(payload.state); if(S.view==='welcome')S.view='plan'; }
+  showSharedBanner();
+  render({top:true});
+}
+function shareLinkFailed(msg){
+  byId('topbar').classList.add('hide');
+  byId('main').innerHTML='<div class="welcome"><div class="eyebrow">Shared plan</div>'+
+    '<h1 style="font-size:clamp(28px,6vw,44px)">This link did not open.</h1>'+
+    '<p class="lede">'+esc(msg)+' Ask whoever sent it to send a fresh one, or to paste their backup text instead.</p>'+
+    '<div><button class="btn" data-act="go" data-v="paths">Start my own instead</button></div></div>';
+}
+
 load();
 if(S.view!=='welcome'&&!RENDER[S.view])S.view='welcome';
-if(SEED){
-  const bar=byId('sharedbar');
-  if(bar){
-    const who=(SEED.from||'').trim();
-    let when='';
-    try{ if(SEED.at)when=' on '+new Date(SEED.at).toLocaleDateString(undefined,{month:'long',day:'numeric',year:'numeric'}); }catch(e){}
-    bar.innerHTML='You are looking at <b>'+esc(who?who+"'s plan":'a plan someone shared with you')+'</b>'+esc(when)+
-      '. Anything you change stays on this device and does not reach them.';
-    bar.style.display='block';
-  }
+if(SEED)showSharedBanner();
+
+if(hashSeed){
+  byId('topbar').classList.add('hide');
+  byId('main').innerHTML='<div class="welcome"><div class="eyebrow">Shared plan</div>'+
+    '<h1 style="font-size:clamp(28px,6vw,44px)">Opening a shared plan…</h1>'+
+    '<p class="lede">Unpacking it from the link. This happens on your device; nothing is downloaded.</p></div>';
+  decodeSeed(hashSeed).then(adoptShared).catch(function(err){
+    shareLinkFailed(err&&/gzip/.test(String(err&&err.message))
+      ? 'This browser cannot unpack it.'
+      : 'The link looks incomplete, which usually means it was cut short on the way.');
+  });
+}else{
+  render({top:true});
 }
-render({top:true});
 </script>

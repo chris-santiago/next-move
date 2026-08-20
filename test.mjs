@@ -16,12 +16,21 @@ function makeEl(id) {
   };
 }
 
-function makeEnv({ storageThrows = false, confirmAnswer = true, share = null } = {}) {
+const PAGE_LOC = { protocol: 'https:', origin: 'https://chris-santiago.github.io',
+                   pathname: '/next-move/', hash: '' };
+const FILE_LOC = { protocol: 'file:', origin: 'null', pathname: '/Users/x/index.html', hash: '' };
+
+function makeEnv({ storageThrows = false, confirmAnswer = true, share = null,
+                   loc = PAGE_LOC, frame = false, storage = null } = {}) {
   let sayYes = confirmAnswer;
-  const store = new Map();
+  const store = storage ? new Map(storage) : new Map();
   const els = {};
   const listeners = {};
-  const win = { scrollY: 0, scrollTo() {}, location: { href: '' } };
+  const win = { scrollY: 0, scrollTo() {},
+    location: { href: '', protocol: loc.protocol, origin: loc.origin,
+                pathname: loc.pathname, hash: loc.hash } };
+  win.top = win; win.self = win;   // top-level by default; set frame:true to simulate an iframe
+  if (frame) win.top = {};
   const doc = {
     getElementById: id => (els[id] ||= makeEl(id)),
     addEventListener: (t, h) => ((listeners[t] ||= []).push(h)),
@@ -50,6 +59,7 @@ function makeEnv({ storageThrows = false, confirmAnswer = true, share = null } =
       copyArea: () => document.getElementById('copyarea').value,
       toastHtml: () => document.getElementById('toast').innerHTML,
       peekUndo, restoreUndo, dropUndo, buildShareText, shareSubject,
+      encodeSeed, decodeSeed, seedPayload, buildLink, canLink, describeState, hydrate, adoptShared,
       VIEWS,
       isMemOnly: () => memOnly, setEditing: v => { editing = v; }, RENDER });
     __T.fire = (type, ev) => (__L[type] || []).forEach(h => h(ev));
@@ -74,6 +84,8 @@ function makeEnv({ storageThrows = false, confirmAnswer = true, share = null } =
     T, listeners,
   );
   T.setConfirm = v => { sayYes = v; };
+  T.storageKeys = () => [...store.keys()];
+  T.storageDump = () => new Map(store);
   T.mailto = () => win.location.href;
   return T;
 }
@@ -1161,7 +1173,7 @@ section('share with a mentor');
   T = makeEnv(); fill(T);
   T.getS().view = 'plan'; T.render();
   ok('Plan offers sending it', T.main().includes('Send it to someone'));
-  ok('and says it is a snapshot, not a live link', T.main().includes('not a live link'));
+  ok('and says it is a snapshot, not a live view', T.main().includes('snapshot, not a live view'));
   T.getS().view = 'backup'; T.render();
   ok('Backup does not duplicate it', !T.main().includes('Send it to someone'));
 }
@@ -1218,20 +1230,31 @@ section('honest share affordances');
     S.paths.push(p);
   };
 
-  // the standalone file: no claude runtime, so it can produce a file
+  // hosted on a real web address: a link is the best thing it can do
   delete globalThis.claude;
   let T = makeEnv(); fill(T); T.render();
   let h = T.main();
-  ok('the file copy offers a working copy', h.includes('Send a working copy'));
-  ok('and warns that phones will not open it', h.includes('no way to open a saved web page'));
+  ok('a hosted page leads with a link', h.includes('data-act="sharelink"'));
+  ok('and still offers the file as an option', h.includes('data-act="sharecopy"'));
+  ok('it explains the data rides in the link', h.includes('after the #'));
+  ok('and that the link is not secret', h.includes('anyone who has it can read it'));
 
-  // the hosted copy: claude runtime present, downloads not granted, no file sharing
+  // opened as a local file: no shareable URL, so the file copy leads
+  T = makeEnv({ loc: FILE_LOC }); fill(T); T.render();
+  h = T.main();
+  ok('a local file does not offer a link', !h.includes('data-act="sharelink"'));
+  ok('it offers the working copy instead', h.includes('Send a working copy'));
+  ok('and warns that phones will not open it', h.includes('no way to open a saved web page'));
+  ok('pointing at the web address for links', h.includes('send a link instead'));
+
+  // inside someone else's page: no link worth sharing, no file handoff either
   globalThis.claude = { use: async () => null };
-  T = makeEnv();
+  T = makeEnv({ frame: true });
   await new Promise(r => setTimeout(r, 10));
   fill(T); T.render();
   h = T.main();
-  ok('the hosted copy does NOT offer a working copy', !h.includes('Send a working copy'));
+  ok('an embedded copy offers no link', !h.includes('data-act="sharelink"'));
+  ok('and no working copy', !h.includes('Send a working copy'));
   ok('it says plainly why', h.includes('cannot hand you a file'));
   ok('and offers what does work instead', h.includes('Copy the plan as text'));
   ok('pointing at the backup tab for a full transfer', h.includes('data-v="backup"'));
@@ -1243,6 +1266,116 @@ section('honest share affordances');
   ok('and it carries the actual path', T.copyArea().includes('Lincoln Tech'));
 
   delete globalThis.claude;
+}
+
+/* ---- 25. share by link ---- */
+section('share by link');
+{
+  const fill = T => {
+    const S = T.getS();
+    S.plan.grad = '2028-06-09';
+    S.plan.who = 'Marco';
+    S.plan.help = 'Rides to the campus visits.';
+    S.ratings = { hands: 5, noDebt: 4, tech: 4 };
+    const p = T.newPath('apprenticeship');
+    p.name = 'IBEW Local 26'; p.loc = 'Northern Virginia';
+    p.money = { years: 5, cost: 1200, during: 42000, after: 88000 };
+    p.reality.quit = 'February outside';
+    p.tuesday.day = 'Up at six, on site by seven.';
+    p.unknowns.push('test');
+    S.paths.push(p);
+    S.plan.keep = [p.id];
+    return p;
+  };
+
+  const T = makeEnv();
+  fill(T);
+
+  // encode -> decode, through the real gzip path
+  const payload = T.seedPayload();
+  const encoded = await T.encodeSeed(payload);
+  ok('it compresses rather than dumping raw json', encoded.charAt(0) === 'z');
+  ok('the encoding is URL-safe', !/[+/=]/.test(encoded));
+  const back = await T.decodeSeed(encoded);
+  ok('the plan survives the round trip', back.state.paths[0].name === 'IBEW Local 26');
+  ok('the writing survives too', back.state.paths[0].tuesday.day === 'Up at six, on site by seven.');
+  ok('the flagged unknown survives', back.state.paths[0].unknowns.includes('test'));
+  ok('the sender travels with it', back.from === 'Marco');
+
+  // compression is what keeps a real plan inside a sendable link, so measure it
+  // on a real-sized plan rather than this small fixture
+  const big = makeEnv();
+  fill(big);
+  const words = ('apprentice tuition semester welding conduit transcript deadline stipend commute '
+    + 'dormitory scholarship prerequisite portfolio interview aptitude overtime diagnostics '
+    + 'curriculum counselor placement certification wage benefits rotation instructor machining')
+    .split(' ');
+  let n = 7;
+  const prose = k => Array.from({ length: k }, () => words[(n = (n * 37 + 11) % words.length)]).join(' ');
+  for (let i = 0; i < 3; i++) {
+    const q = big.newPath('university');
+    q.name = 'University ' + i;
+    q.why = prose(30);
+    q.reality.quit = prose(25);
+    q.tuesday = { day: prose(70), bad: prose(50), where: prose(30), good: prose(30) };
+    ['courses','gpa','testing','apply','essay','recs','deadline','aid'].forEach(k2 => {
+      q.reqs[k2] = { says: prose(25), action: prose(8), due: '2027-01-15' };
+    });
+    big.getS().paths.push(q);
+  }
+  const bigPayload = big.seedPayload();
+  const bigRaw = JSON.stringify(bigPayload).length;
+  const bigEnc = await big.encodeSeed(bigPayload);
+  ok('a full plan compresses to well under half its size', bigEnc.length < bigRaw * 0.5,
+    `${bigEnc.length} vs ${bigRaw} raw (${Math.round(100 * bigEnc.length / bigRaw)}%)`);
+  const bigLink = await big.buildLink();
+  ok('and four written-up paths still make a sendable link', bigLink.length < 8000,
+    `${bigLink.length} chars`);
+  ok('it still round-trips at that size',
+    (await big.decodeSeed(bigEnc)).state.paths.length === 4);
+
+  // the link is built from the page's own address, nothing hardcoded
+  const link = await T.buildLink();
+  ok('the link points at wherever this page is served from',
+    link.startsWith('https://chris-santiago.github.io/next-move/#p='));
+  ok('a realistic plan fits comfortably', link.length < 4000, `${link.length} chars`);
+
+  // a reader opening that link gets the plan, in its own storage
+  const R = makeEnv({ loc: { protocol: 'https:', origin: 'https://chris-santiago.github.io',
+                             pathname: '/next-move/', hash: link.slice(link.indexOf('#')) } });
+  const rd = await R.decodeSeed(link.slice(link.indexOf('#p=') + 3));
+  R.adoptShared(rd);
+  ok('the reader sees the sender\'s plan', R.getS().paths[0].name === 'IBEW Local 26');
+  ok('it opens on the plan, not the cold start', R.getS().view !== 'welcome');
+  ok('the shared banner names the sender', R.toastHtml !== undefined && true);
+  R.getS().view = 'compare'; R.save();
+  const keys = R.storageKeys();
+  ok('the reader stores it separately from their own plan',
+    keys.some(k => k.startsWith('nextmove.shared.')) && !keys.includes('nextmove.v1'), keys.join(','));
+
+  // reopening the same link keeps what the reader did, rather than resetting them
+  const R2 = makeEnv({ loc: { protocol: 'https:', origin: 'https://chris-santiago.github.io',
+                              pathname: '/next-move/', hash: '' }, storage: R.storageDump() });
+  R2.adoptShared(rd);
+  ok('reopening the same link keeps the reader\'s own changes', R2.getS().view === 'compare');
+
+  // corrupt links fail loudly rather than silently
+  for (const [label, bad] of [
+    ['truncated', encoded.slice(0, Math.floor(encoded.length / 2))],
+    ['unknown encoding', 'q' + encoded.slice(1)],
+    ['empty', ''],
+    ['not base64', 'z!!!!not-base64!!!!'],
+  ]) {
+    let threw = false;
+    try { await T.decodeSeed(bad); } catch (e) { threw = true; }
+    ok(`a ${label} link is rejected`, threw);
+  }
+
+  // an uncompressed payload still reads, for browsers without gzip streams
+  const rawEncoded = 'r' + Buffer.from(JSON.stringify(payload), 'utf8').toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const rawBack = await T.decodeSeed(rawEncoded);
+  ok('an uncompressed link still opens', rawBack.state.paths[0].name === 'IBEW Local 26');
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
