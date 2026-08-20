@@ -1,0 +1,12 @@
+# Build output. Rebuilt by build.py locally and by CI for deploys.
+dist/
+
+# Dev-tool scratch output
+shots/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
